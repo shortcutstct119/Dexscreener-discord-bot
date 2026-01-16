@@ -1,6 +1,13 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const dotenv = require('dotenv');
-const { fetchPairData } = require('./utils');
+const { fetchTokenStats } = require('./utils/dexscreener');
+const { TokenListener } = require('./solana/tokenListener');
+const { BuyDetector } = require('./logic/buyDetector');
+const { NewHolderDetector } = require('./logic/newHolderDetector');
+const { LargeBuyAlerts } = require('./logic/largeBuyAlerts');
+const { MarketCapMilestones } = require('./logic/marketCapMilestones');
+const { ContestReminders } = require('./logic/contestReminders');
+const { sendMessage } = require('./discord/notifier');
 
 dotenv.config();
 
@@ -64,18 +71,17 @@ async function updateVoiceChannelName() {
       return;
     }
 
-    const data = await fetchPairData();
+    const stats = await fetchTokenStats();
     
-    if (!data || !data.pair) {
-      console.error('❌ Failed to fetch pair data');
+    if (!stats) {
+      console.error('❌ Failed to fetch token stats');
       return;
     }
 
-    const pair = data.pair;
     const symbol = process.env.TOKEN_SYMBOL || 'TOKEN';
-    const price = formatPrice(Number(pair.priceUsd));
-    const mcap = formatNumber(Number(pair.fdv || pair.marketCap || 0));
-    const priceChange24h = formatPercentageChange(Number(pair.priceChange?.h24 || 0));
+    const price = formatPrice(stats.priceUsd);
+    const mcap = formatNumber(stats.marketCap);
+    const priceChange24h = formatPercentageChange(stats.priceChange24h);
 
     // Format: $WISH 12.4% | $259k | $0.000260
     const channelName = `$${symbol} ${priceChange24h}% | $${mcap} | $${price}`;
@@ -106,7 +112,7 @@ async function updateVoiceChannelName() {
   }
 }
 
-client.on('ready', () => {
+client.on('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`🔄 Update frequency: ${process.env.UPDATE_FREQUENCY || 6000}ms`);
   console.log(`📊 Monitoring token: $${process.env.TOKEN_SYMBOL || 'TOKEN'}`);
@@ -115,12 +121,130 @@ client.on('ready', () => {
   console.log(`🎤 Voice Channel ID: ${process.env.VOICE_CHANNEL_ID}`);
   console.log('🚀 Bot is running...\n');
 
-  // Initial update
+  // Initialize Solana token listener
+  let tokenListener = null;
+  let buyDetector = null;
+  let newHolderDetector = null;
+  let largeBuyAlerts = null;
+  let marketCapMilestones = null;
+  let contestReminders = null;
+
+  // Initialize Solana listener if configured
+  if (process.env.SOLANA_RPC_WS && process.env.TOKEN_MINT) {
+    try {
+      console.log('🔗 Initializing Solana token listener...');
+      tokenListener = new TokenListener();
+      
+      tokenListener.on('error', (error) => {
+        console.error('❌ Token listener error:', error.message);
+      });
+
+      const listenerStarted = await tokenListener.start();
+      if (listenerStarted) {
+        console.log('✅ Solana token listener started\n');
+
+        // Initialize buy detector if AMM vaults are configured
+        if (process.env.AMM_VAULTS && process.env.AMM_VAULTS.trim() !== '') {
+          console.log('💰 Initializing buy detector...');
+          buyDetector = new BuyDetector(tokenListener);
+          
+          buyDetector.on('buy', (buyData) => {
+            console.log(`💰 Buy detected: ${buyData.amount.toLocaleString()} tokens by ${buyData.buyer.slice(0, 8)}...`);
+          });
+
+          if (buyDetector.start()) {
+            console.log('✅ Buy detector started\n');
+
+            // Initialize large buy alerts if threshold is configured
+            if (process.env.LARGE_BUY_USD && process.env.LARGE_BUY_USD.trim() !== '') {
+              console.log('📢 Initializing large buy alerts...');
+              largeBuyAlerts = new LargeBuyAlerts(buyDetector, client);
+              
+              if (largeBuyAlerts.start()) {
+                console.log(`✅ Large buy alerts started (threshold: $${largeBuyAlerts.getThreshold().toLocaleString()})\n`);
+              }
+            }
+          }
+        }
+
+        // Initialize new holder detector
+        console.log('🆕 Initializing new holder detector...');
+        newHolderDetector = new NewHolderDetector(tokenListener);
+        
+        newHolderDetector.on('newHolder', async (holderData) => {
+          const tokenSymbol = process.env.TOKEN_SYMBOL || 'TOKEN';
+          const walletDisplay = `${holderData.wallet.slice(0, 4)}...${holderData.wallet.slice(-4)}`;
+          const explorerLink = `https://solscan.io/account/${holderData.wallet}`;
+          
+          const message = `🆕 **New Holder Detected!** 🆕\n\n` +
+            `👤 **Wallet:** \`${walletDisplay}\`\n` +
+            `💰 **Balance:** ${holderData.balance.toLocaleString()} $${tokenSymbol}\n` +
+            `🔗 **View:** [Solscan](${explorerLink})`;
+
+          console.log(`🆕 New holder: ${walletDisplay} (${holderData.balance.toLocaleString()} tokens)`);
+          await sendMessage(client, message);
+        });
+
+        if (newHolderDetector.start()) {
+          console.log('✅ New holder detector started\n');
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error initializing Solana listener:', error.message);
+    }
+  } else {
+    console.log('⚠️  Solana listener not configured (SOLANA_RPC_WS or TOKEN_MINT missing)\n');
+  }
+
+  // Initialize market cap milestones if configured
+  if (process.env.MARKET_CAP_MILESTONES && process.env.MARKET_CAP_MILESTONES.trim() !== '') {
+    console.log('🎯 Initializing market cap milestones...');
+    marketCapMilestones = new MarketCapMilestones();
+    
+    marketCapMilestones.on('milestone', async (milestoneData) => {
+      const tokenSymbol = process.env.TOKEN_SYMBOL || 'TOKEN';
+      const formattedMilestone = milestoneData.milestone.toLocaleString('en-US', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+      });
+      const formattedMarketCap = milestoneData.marketCap.toLocaleString('en-US', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+      });
+
+      const message = `🎯 **Market Cap Milestone Reached!** 🎯\n\n` +
+        `💰 **Milestone:** $${formattedMilestone}\n` +
+        `📊 **Current Market Cap:** $${formattedMarketCap}\n` +
+        `🎉 Congratulations on reaching this milestone for $${tokenSymbol}!`;
+
+      console.log(`🎯 Market cap milestone: $${formattedMilestone} (Current: $${formattedMarketCap})`);
+      await sendMessage(client, message);
+    });
+
+    // Start monitoring (check every 60 seconds)
+    if (marketCapMilestones.startMonitoring(60000)) {
+      console.log('✅ Market cap milestones monitoring started\n');
+    }
+  }
+
+  // Initialize contest reminders if configured
+  if (process.env.CONTEST_START_TIME && process.env.CONTEST_END_TIME) {
+    console.log('⏰ Initializing contest reminders...');
+    contestReminders = new ContestReminders(client);
+    
+    if (contestReminders.start()) {
+      console.log(`✅ Contest reminders scheduled (${contestReminders.getScheduledCount()} reminders)\n`);
+    }
+  }
+
+  // Initial voice channel update
   updateVoiceChannelName();
 
-  // Set interval for updates (default: 6000ms = 6 seconds)
+  // Set interval for voice channel updates (default: 180000ms = 3 minutes)
   const updateFrequency = parseInt(process.env.UPDATE_FREQUENCY) || 180000;
   setInterval(updateVoiceChannelName, updateFrequency);
+
+  console.log('✨ All modules initialized and running!\n');
 });
 
 client.login(process.env.DISCORD_TOKEN);
