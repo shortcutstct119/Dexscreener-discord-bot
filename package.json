@@ -1,0 +1,16 @@
+{
+  "name": "pricemonitor",
+  "version": "1.0.0",
+  "description": "DEXScreener monitor with Discord bot.",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "author": "mmq88x <mail@mmq.dev>",
+  "license": "MIT",
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "discord.js": "^14.0.0",
+    "dotenv": "^16.4.2"
+  }
+}
